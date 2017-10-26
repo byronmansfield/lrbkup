@@ -1,0 +1,1305 @@
+#!/bin/bash
+
+#
+# Lightroom Backup Script
+#
+# A script that automates the backing up of Lightroom photos
+# to ensure lowest chance of loss in case of crash
+# It will backup local storage to and external or to Amazon S3
+# and can also back sync from one of those to your local
+# Written and maintained by Byron Mansfield byron@byronmansfield.com
+#
+# Usage:
+# Make sure file is executable and in your $PATH
+# Then just run it like so
+# > ./lrbkup
+#
+
+# Globals
+BKUP_DATE=`date +%s`
+LOCAL_LR_PATH="$HOME/Pictures/Lightroom"
+declare -A EXT_DRIVES
+EXT_DRIVE="Storage"
+EXT_LR_PATH="/Volumes/$EXT_DRIVE/Lightroom"
+S3_LR_PATH="lightroom-bkup/Lightroom Photos/"
+LOG_FILE_PATH="$HOME/Pictures/Lightroom"
+RSYNC_LOG_FILE_NAME="rsync"
+RSYNC_LOG_FILE="$RSYNC_LOG_FILE_NAME.log"
+RSYNC_LOG_FILE_OUTPUT="rsync-output.log"
+S3_LOG_FILE="s3.log"
+BKUP_ARCHIVED_LOGS_PATH="$LOCAL_LR_PATH/backup-logs"
+RSYNC_BKUP_ARCHIVED_LOGS_PATH="$BKUP_ARCHIVED_LOGS_PATH/local-to-external"
+S3_BKUP_ARCHIVED_LOGS_PATH="$BKUP_ARCHIVED_LOGS_PATH/external-to-s3"
+CR=$(printf '\r')
+options=("Backup my local photos to an external drive" "Backup my external drive to S3" "Clear local photos from ${LOCAL_LR_PATH}" "Sync my local from an external drive" "Pull down photos from S3" "Quit [Quit/quit/Q/q]")
+
+# a few small things for pretty outputs
+red='\033[0;31m'
+green='\033[0;32m'
+yellow='\033[0;33m'
+NC='\033[0m'
+cross=$(echo -e "${red}\xE2\x9C\x98${NC}")
+warning=$(echo -e "${yellow}\xE2\x9A\xA0${NC}")
+checkmark=$(echo -e "${green}\xE2\x9C\x94${NC}")
+
+####################################################
+#      -- [ main entry point ]--                   #
+# basically the menu prompt for the user to select #
+####################################################
+function main() {
+
+  # check bash version for script compatibility
+  bash_version_check
+
+  if [ "$?" -eq "0" ]; then
+
+    read -r -p " What sort of Lightroom backup or sync would you like to perform? $CR $CR
+      1) Backup my local photos to an external drive $CR
+      2) Backup my external drive to S3 $CR
+      3) Clear local photos from ${LOCAL_LR_PATH} $CR
+      4) Sync my local from an external drive (not ready yet)$CR
+      5) Pull down photos from S3 (not ready yet) $CR
+      6) Quit [Quit/quit/Q/q] $CR
+      > " input
+
+    case $input in
+      1|2|3|4|5)
+        confirm_selection $input
+        ;;
+      6|[qQ][uU][iI][tT]|[qQ])
+        quit_prompt
+        ;;
+      *)
+        invalid_input
+        ;;
+    esac
+  fi
+}
+
+######################################################
+# A bunch of interactive catches for the read prompt #
+######################################################
+
+#
+#          bash version check
+# this is important because of this script requires
+# associative arrays only supported in bash 4
+#
+function bash_version_check() {
+  if ((BASH_VERSINFO[0] < 4)); then
+    echo "Sorry, you need at least bash-4.0 to run this script."
+    echo "Please upgrade to Bash 4 and try again"
+    tput bel
+    exit 1
+  fi
+}
+
+#
+# unmount any drive
+# expects a external drive as an argument
+#
+function unmount_drive() {
+  diskutil unmount $1
+}
+
+#
+# spinner
+# usage: lengthy_cmd & spinner $!
+# note ready yet, still under development
+#
+function spinner() {
+    local pid=$1
+    local delay=0.75
+    local spinstr='|/-\'
+    while [ "$(ps a | awk '{print $1}' | grep $pid)" ]; do
+        local temp=${spinstr#?}
+        printf " [%c]  " "$spinstr"
+        local spinstr=$temp${spinstr%"$temp"}
+        sleep $delay
+        printf "\b\b\b\b\b\b"
+    done
+    printf "    \b\b\b\b"
+}
+
+#
+# last thing before exiting script
+# prompt user to unmount drive if it is still mounted before closing script
+#
+function quit_prompt() {
+
+  if [[ "${#EXT_DRIVES[@]}" -lt '1' ]]; then
+    read -r -p "Before I go, would you like me to unmount external drive ${EXT_DRIVE}? [Y/n] " unmount
+
+    case $unmount in
+      [yY][eE][sS]|[yY])
+        unmount_drive ${EXT_DRIVE} && tput bel
+        if [ "$?" -eq "0" ]; then
+          echo "Drive ${EXT_DRIVE} ejected successfully. Safe to unplug the USB"
+          echo "Thank you for using Lightroom Backup Script"
+          echo "Good Bye!"
+          exit 1
+        else
+          echo "Something went wrong with trying to unmount. I suggest you try it manually"
+          tput bel
+          exit 1
+        fi
+        ;;
+      [nN][oO]|[nN])
+        echo "You chose to quit the Lightroom Backup and Sync script without unmounting."
+        echo "Thank you for using Lightroom Backup Script"
+        echo "Good Bye!"
+        exit 1
+        ;;
+      *)
+        invalid_input
+        ;;
+    esac
+  else
+    echo "Thank you for using Lightroom Backup Script"
+    echo "Good Bye!"
+    exit 1
+  fi
+}
+
+#
+# prompt the user to try another selection if they got it wrong the first time
+#
+function prompt_to_reselect() {
+  echo "Ok, I will not perform previously backup selected"
+  echo "Please try again"
+  main
+}
+
+#
+# tell the user they entered something that is not a valid option and reprompt them for a selection
+#
+function invalid_input() {
+  echo "I'm sorry I am a dumb script and do not understand that option."
+  echo "My creator must not have programmed me to understand that option"
+  echo "Can you please try that again?"
+  main
+}
+
+#
+# once a backup or sync task has been successful
+# reprompt the user in case they want
+#
+function success_more_backups() {
+
+  # alert success
+  tput bel
+
+  # prompt for more backups
+  read -r -p "Would you like to perform more backups today? [Y/n] " input
+  case $input in
+    [yY][eE][sS]|[yY])
+      main
+      ;;
+    [nN][oO]|[nN])
+      echo "Ok, have a good day"
+      echo "Good Bye!"
+      exit 1
+      ;;
+    *)
+      echo "I'm sorry I am a dumb script and do not understand that option."
+      echo "My creator must not have programmed me to understand that option"
+      echo "But since this is the end of the script anyways, I'm going to exit"
+      echo "If this is a mistake and you would like to perform more backups, please re-run this script"
+      echo "Good Bye!"
+      exit 1
+      ;;
+  esac
+}
+
+#
+# confirm the users entered selection and pass it to the appropriate task if correct
+#
+function confirm_selection() {
+  index=$((${1}-1))
+  option_string=`echo ${options[$index]}`
+  echo "You chose option ${1}. ${option_string}"
+  read -r -p "Is this correct? [Y/n] " input
+  case $input in
+    [yY][eE][sS]|[yY])
+      if [ $1 -eq 1 ]; then
+        backup_to_external
+      elif [ $1 -eq 2 ]; then
+        backup_to_s3
+      elif [ $1 -eq 3 ]; then
+        clear_local
+      elif [ $1 -eq 4 ]; then
+        sync_local_from_external
+      elif [ $1 -eq 5 ]; then
+        pull_down_from_s3
+      fi
+      ;;
+    [nN][oO]|[nN])
+      prompt_to_reselect
+      ;;
+    *)
+      invalid_input
+      ;;
+  esac
+}
+
+####################################################
+#      -- [ The actual Tasks ]--                   #
+####################################################
+
+########################################
+#    Backup Local To External Drive    #
+########################################
+
+#
+# check to see if the external drive is attached
+#
+function external_drive_check() {
+
+  OIFS=$IFS
+  IFS= mapfile -t DISKUTIL_LIST < <(diskutil list external)
+
+  # loop over mounted drives to populate the global variable
+  for line in "${DISKUTIL_LIST[@]}"; do
+    DISK_MOUNT=$(echo $line | awk '{print $1}')
+    if [[ "${#DISK_MOUNT}" -lt '3' ]]; then
+      :
+    else
+      ARRAY_INDEX=$(mount | grep "$DISK_MOUNT" | awk '{print $3}' | awk -F'/' '{print   $NF}')
+      MOUNT_POINT=$(mount | grep "$DISK_MOUNT" | awk '{print $1}')
+      EXT_DRIVES+=([${ARRAY_INDEX}]="$MOUNT_POINT")
+    fi
+  done
+
+  IFS=${OIFS}
+}
+
+#
+# prompt for which external drive to backup to
+#
+function prompt_for_drive_selection() {
+
+  cr=`echo $'\n.'`
+  cr=${cr%.}
+
+  echo "Searching for mounted external hard drives $cr"
+
+  # check if 0 drives are mounted
+  if [[ "${#EXT_DRIVES[@]}" -lt '1' ]]; then
+    echo "I'm sorry, I don't see any attached external hard drives"
+    echo "Please attach an external drive and try again"
+
+    read -r -p "Would you like to perform another task? [Y/n] " input
+
+    case $input in
+      [yY][eE][sS]|[yY])
+        main
+        ;;
+      [nN][oO]|[nN])
+        tput bel
+        quit_prompt
+        exit 1
+        ;;
+      *)
+        tput bel
+        invalid_input
+        exit 1
+        ;;
+    esac
+  else # a single drive must be mounted
+
+    prompt_string="Please select which external drive you would like to backup to? $cr $cr"
+
+    # make list of drives mounted for prompt string
+    index=1
+    for disk in "${!EXT_DRIVES[@]}"; do
+      index_as_string="$index"
+      prompt_string="$prompt_string $index_as_string) $disk $cr"
+      index=$((index=index+1))
+    done
+
+    # add an additional item to prompt string for none
+    index_as_string="$index"
+    prompt_string="$prompt_string $index_as_string) None of the above/I do not see the drive [Q/q] $cr"
+    prompt_string="$prompt_string > "
+
+    read -r -p "I found the following external drives $cr $cr $prompt_string" drive
+
+    case $drive in
+      $index_as_string|[qQ][uU][iI][tT]|[qQ])
+        quit_prompt
+        ;;
+      [1-9])
+        drive_names=(${!EXT_DRIVES[@]})
+        drive_index=$((drive-1))
+        EXT_DRIVE="${drive_names[$drive_index]}"
+        echo "Performing local backup to external drive $EXT_DRIVE"
+        ;;
+      *)
+        tput bel
+        invalid_input
+        exit 1
+        ;;
+    esac
+  fi
+}
+
+#
+# last rysnc
+# basically just a check of the rsync log file to give some basic feedback in tty
+#
+function last_rsync() {
+  echo "Checking last external backup ..."
+  logfile="$LOG_FILE_PATH/$RSYNC_LOG_FILE"
+
+  # if logfile exists
+  if [ -f "$logfile" ]; then
+    status=`head -n 1 $logfile`
+    last_rsync_date=`sed -n '2p' $logfile | sed 's/[^0-9]*//g'`
+    last_rsync_date_formated=`date --date @$last_rsync_date`
+    last_rsync_date_filename=`date --date @$last_rsync_date +"%Y-%m-%d_%H-%M-%S"`
+
+    echo "Last Backup was performed on $last_rsync_date_formated"
+
+    if [ $status == "Successful" ]; then
+      echo "Last Backup was Successful. Archiving the last rsync log file"
+      mv "$logfile" "$RSYNC_BKUP_ARCHIVED_LOGS_PATH/successful/$last_rsync_date_filename-rsync.log"
+    else
+      echo "Last Backup was NOT Successful. :[ Archiving the last rsync log file"
+      mv "$logfile" "$RSYNC_BKUP_ARCHIVED_LOGS_PATH/failures/$last_rsync_date_filename-rsync.log"
+    fi
+  else # no logfile so continue inform user and prompt for continue
+    echo "No log file found. We will create one with this backup."
+
+    read -r -p "Would you like to continue? [Y/n] " input
+
+    case $input in
+      [yY][eE][sS]|[yY])
+        echo "Creating log file ..."
+        ;;
+
+      [nN][oO]|[nN])
+        tput bel
+        echo "Exiting. No backup being performed"
+        prompt_to_reselect
+        exit 1
+        ;;
+
+      *)
+        tput bel
+        invalid_input
+        exit 1
+        ;;
+    esac
+  fi
+}
+
+#
+# main entry point for back up to external drive task
+#
+function backup_to_external() {
+
+  # check if external drive is connected
+  external_drive_check
+
+  # prompt for which external drive to back up to
+  prompt_for_drive_selection
+
+  # last rsync check
+  last_rsync
+
+  echo "Backing up local to external drive $EXT_DRIVE. Please do not disconnect the drive until completed"
+
+  # rsync files to external
+  if [ "$?" -eq "0" ]; then
+    rsync \
+      --archive \
+      --compress \
+      --partial \
+      --checksum \
+      --verbose \
+      --progress \
+      --stats \
+      --log-file="$LOG_FILE_PATH/$RSYNC_LOG_FILE" \
+      $LOCAL_LR_PATH/ \
+      $EXT_LR_PATH \
+      | tee /dev/stderr > "$LOG_FILE_PATH/$RSYNC_LOG_FILE_OUTPUT"
+
+    if [ "$?" -eq "0" ]; then
+      sed -i "1i$CR" "$LOG_FILE_PATH/$RSYNC_LOG_FILE"
+      sed -i "1i============================" "$LOG_FILE_PATH/$RSYNC_LOG_FILE"
+      sed -i "1iContents from rsync log file" "$LOG_FILE_PATH/$RSYNC_LOG_FILE"
+      sed -i "1i============================" "$LOG_FILE_PATH/$RSYNC_LOG_FILE"
+      sed -i "1i$CR" "$LOG_FILE_PATH/$RSYNC_LOG_FILE"
+      sed -i "1iBackup: $BKUP_DATE\n/" "$LOG_FILE_PATH/$RSYNC_LOG_FILE"
+      sed -i "1iSuccessful" "$LOG_FILE_PATH/$RSYNC_LOG_FILE"
+
+      # add some seperation between rsync log file and the rsync output file then append output file and delte it
+      echo "" >> "$LOG_FILE_PATH/$RSYNC_LOG_FILE"
+      echo "============================" >> "$LOG_FILE_PATH/$RSYNC_LOG_FILE"
+      echo "  Contents of Output file" >> "$LOG_FILE_PATH/$RSYNC_LOG_FILE"
+      echo "============================" >> "$LOG_FILE_PATH/$RSYNC_LOG_FILE"
+      echo "" >> "$LOG_FILE_PATH/$RSYNC_LOG_FILE"
+      cat "$LOG_FILE_PATH/$RSYNC_LOG_FILE_OUTPUT" >> "$LOG_FILE_PATH/$RSYNC_LOG_FILE"
+      rm "$LOG_FILE_PATH/$RSYNC_LOG_FILE_OUTPUT"
+
+      success_more_backups
+    else
+      sed -i "1iBackup: $BKUP_DATE\n/" "$LOG_FILE_PATH/$RSYNC_LOG_FILE"
+      sed -i "1iFailed" "$LOG_FILE_PATH/$RSYNC_LOG_FILE"
+
+      # add some seperation between rsync log file and the rsync output file then append output file and delte it
+      echo "" >> "$LOG_FILE_PATH/$RSYNC_LOG_FILE"
+      echo "============================" >> "$LOG_FILE_PATH/$RSYNC_LOG_FILE"
+      echo "  Contents of Output file" >> "$LOG_FILE_PATH/$RSYNC_LOG_FILE"
+      echo "============================" >> "$LOG_FILE_PATH/$RSYNC_LOG_FILE"
+      echo "" >> "$LOG_FILE_PATH/$RSYNC_LOG_FILE"
+      cat "$LOG_FILE_PATH/$RSYNC_LOG_FILE_OUTPUT" >> "$LOG_FILE_PATH/$RSYNC_LOG_FILE"
+      rm "$LOG_FILE_PATH/$RSYNC_LOG_FILE_OUTPUT"
+
+      # alert there was an error and exit
+      tput bel
+      exit 1
+    fi
+  fi
+}
+
+########################################
+#  Backup External Drive To Amazon S3  #
+########################################
+
+#
+# something
+#
+# function do_comp_exthdd_to_s3() {
+
+  # loop through something that tells me what needs to be syncd
+  # it takes too long
+  # make a log file of last rsync or s3 sync
+  # then make a list of dir's (dates) that need to be aws s3 syncd
+  # then loop through it doing an aws sync
+  # for i in `command -that -does --comparison=on | diff -of=exthdd -to=s3`; do
+  #   echo "some comparison of what needs to be aws s3 syncd"
+  # done
+
+# }
+
+#
+# check last s3 backup
+#
+function last_s3() {
+
+  # runs the comparison
+  # see if anything has been changed, updated, modified, added
+  # do_comp_exthdd_to_s3
+
+  echo "Checking last Amazon S3 backup ..."
+
+  # testing
+  echo "LOG_FILE_PATH is ${LOG_FILE_PATH}"
+  echo "S3_LOG_FILE is ${S3_LOG_FILE}"
+
+  logfile="${LOG_FILE_PATH}/${S3_LOG_FILE}"
+
+  # testing
+  echo "logfile is ${logfile}"
+
+  # if logfile exists
+  if [ -f "$logfile" ]; then
+    status=`head -n 1 $logfile`
+    last_s3_date=`sed -n '2p' $logfile | sed 's/[^0-9]*//g'`
+    last_s3_date_formated=`date --date @$last_s3_date`
+    last_s3_date_filename=`date --date @$last_s3_date +"%Y-%m-%d_%H-%M-%S"`
+
+    # testing
+    echo "status is ${status}"
+    echo "last_s3_date is ${last_s3_date}"
+    echo "last_s3_date_formated is ${last_s3_date_formated}"
+    echo "last_s3_date_filename is ${last_s3_date_filename}"
+
+    echo "Last Backup was performed on $last_s3_date_formated"
+
+    if [ ${status} -eq "Successful" ]; then
+      echo "Last Backup was Successful. Archiving the last s3 log file"
+      mv "$logfile" "$S3_BKUP_ARCHIVED_LOGS_PATH/successful/$last_s3_date_filename-s3.log"
+    else
+      echo "Last Backup was NOT Successful. :[ Archiving the last s3 log file"
+      mv "$logfile" "$S3_BKUP_ARCHIVED_LOGS_PATH/failures/$last_s3_date_filename-s3.log"
+    fi
+  else
+    echo "No log file found. We will create one with this backup."
+
+    read -r -p "Would you like to continue? [Y/n] " input
+
+    case $input in
+      [yY][eE][sS]|[yY])
+        echo "Creating log file ..."
+        ;;
+
+      [nN][oO]|[nN])
+        tput bel
+        prompt_to_reselect
+        exit 1
+        ;;
+
+      *)
+        tput bel
+        invalid_input
+        exit 1
+        ;;
+    esac
+  fi
+}
+
+#
+# main entry point for backup to S3 task
+#
+function backup_to_s3() {
+  echo "Backing up ${EXT_LR_PATH} to s3://${S3_LR_PATH}"
+
+  # check last backup to s3
+  last_s3
+
+  if [ "$?" -eq "0" ]; then
+    echo "Backing up to Amazon S3 please do not disconnect the external hard drive ${EXT_DRIVE}"
+
+    aws s3 sync \
+      ${EXT_LR_PATH} \
+      s3://"${S3_LR_PATH}" \
+      | tee /dev/stderr > "${LOG_FILE_PATH}/${S3_LOG_FILE}"
+
+    if [ "$?" -eq "0" ]; then
+      sed -i "1i$CR" "$LOG_FILE_PATH/$S3_LOG_FILE"
+      sed -i "1i============================" "$LOG_FILE_PATH/$S3_LOG_FILE"
+      sed -i "1iOutput from aws s3 sync command" "$LOG_FILE_PATH/$S3_LOG_FILE"
+      sed -i "1i$CR" "$LOG_FILE_PATH/$S3_LOG_FILE"
+      sed -i "1iBackup: $BKUP_DATE\n/" "$LOG_FILE_PATH/$S3_LOG_FILE"
+      sed -i "1iSuccessful" "$LOG_FILE_PATH/$S3_LOG_FILE"
+      echo "Everything backed up \"synced\" to Amazon S3 successfully! Hurray!"
+      echo "Please remember I am but a simple script written by my master. Please double check me by looking in S3 and confirm the photos actually backed up before you do something stupid and loose your photos again"
+      echo "If my work in backing up your photos to S3 was successful and you want to repoint your photos source to your external drive in Lightroom, it should be safe to do so now"
+      echo "Once they are repointed to the external drive and you have confirmed that, it should be safe to delete from your local hard drive to free up space"
+      echo "Please take my advice with extreme caution"
+
+      # inform success and prompt user for actions
+      success_more_backups
+
+    else
+      sed -i "1iBackup: $BKUP_DATE\n/" "$LOG_FILE_PATH/$S3_LOG_FILE"
+      sed -i "1iFailed" "$LOG_FILE_PATH/$S3_LOG_FILE"
+      echo "Oops!!! Something went wrong while trying to sync your photos to S3 :["
+      echo "Please check the s3.log and try again"
+
+      # alert there was an error and exit
+      tput bel
+      exit 1
+    fi
+  fi
+}
+
+########################################
+#    Local Hard Drive Clean Up Task    #
+########################################
+
+#
+# this is the great deletion task
+# please use with caution
+# this will blow away everything in local lightroom path
+# this is not reversable
+#
+function delete_all() {
+  echo "don't worry, i'm not actually deleting yet ;)"
+  for d in `find ${LOCAL_LR_PATH} -maxdepth 1 -type d | grep -P "\d{4}" | grep -v -P '-'`; do
+    for sd in `ls ${d}`; do
+      # rm command would go here
+      echo "removing ${d}/${sd}"
+    done
+  done
+}
+
+#
+# this is the single dir deletion task
+# please use with caution
+# expects argument to be passed as the directory to delete
+# this will blow away the entire directory passed
+# this is not reversable
+#
+function delete_dir() {
+  echo "directory passed to be deleted is $1"
+  echo "don't worry, i'm not actually deleting yet ;)"
+
+  pwd=${PWD}
+  cd ${LOCAL_LR_PATH}
+
+  # rm command would go here
+  echo "removing $1"
+
+  cd ${pwd}
+}
+
+#
+# delete only the safe to delete local photos
+# i.e. the ones that have been confirmed backed up to s3
+# expects an array as an arg to be passed
+#
+function delete_only_safe() {
+
+  # rename to something better later
+  array=("$@")
+
+  echo "Remember, you still need to repoint them to your external in Lightroom before you can remove them from your local"
+  read -r -p "Have you repointed them to your external yet? [Y/n] " repointed
+
+  case $repointed in
+    [yY][eE][sS]|[yY])
+      echo "Great!"
+      read -r -p "Would you like me to continue with removing the \"safe to delete\" (backed up to external drive and s3) local lightroom files? FYI: this is the final check before permanently deleting Lightroom photos on your local hard drive. [Y/n] " input
+
+      case $input in
+        [yY][eE][sS]|[yY])
+          # give summary
+          # still a feature I need to create
+          echo "You currently have X amount of free space left on your local hard drive"
+          echo "Removing these photos will free up X amount of space on your hard drive. i.e. the photos to be deleted are taking up X amount of space"
+          echo "Giving you X amount of free space"
+
+          # the actual meat of the task
+          # the rest is just prompting and checking on some things to make sure its safe
+          # this should be moved to the delete_all task
+          # but it needs to be modified to handle both all and ones passed as an array arg
+          for date in "${array[@]}"; do
+            for year in `find ${LOCAL_LR_PATH} -maxdepth 1 -type d | grep -P "\d{4}" | grep -v -P '-'`; do
+              if [ -d "${year}/${date}" ]; then
+                # rm command would go here
+                echo "don't worry, i'm not actually deleting yet ;)"
+                echo "removing ${year}/${date}"
+              fi
+            done
+          done
+
+          echo "At this point I should be done removing all local lightroom photos there where marked as safe to remove and confirmed backed up to s3"
+
+          # give a confirmation summary
+          # still a feature that needs to be completed
+          echo "You now have X amount of free space on your local hard drive because of this deletion"
+          echo "X amount of space from Lightroom photos have been permanently deleted"
+
+          success_more_backups
+          tput bel
+          prompt_to_reselect
+          ;;
+        *)
+          tput bel
+          invalid_input
+          exit 1
+          ;;
+      esac
+      ;;
+    [nN][oO]|[nN])
+      echo "Ok, please repoint them first and try again later"
+      tput bel
+      prompt_to_reselect
+      ;;
+    *)
+      tput bel
+      invalid_input
+      exit 1
+      ;;
+  esac
+}
+
+#
+# s3 diff check ok
+# this is called if there are 0 differences between
+# what is to be deleted on local and what is in s3
+#
+function s3_diff_check_ok() {
+  echo "Looks like everything on your local is in S3"
+  echo "Remember, you still need to repoint them to your external in Lightroom before you can remove them from your local"
+  read -r -p "Have you repointed them to your external yet? [Y/n] " repointed
+
+  case $repointed in
+    [yY][eE][sS]|[yY])
+      echo "Great!"
+      read -r -p "Would you like me to continue with removing all of your local lightroom files? [Y/n] " input
+
+      case $input in
+        [yY][eE][sS]|[yY])
+          delete_all # no more checks a script can do, let the human actually delete now
+          ;;
+        [nN][oO]|[nN])
+          tput bel
+          prompt_to_reselect
+          ;;
+        *)
+          tput bel
+          invalid_input
+          exit 1
+          ;;
+      esac
+      ;;
+    [nN][oO]|[nN])
+      echo "Ok, please repoint them first and try again later"
+      tput bel
+      prompt_to_reselect
+      ;;
+    *)
+      tput bel
+      invalid_input
+      exit 1
+      ;;
+  esac
+}
+
+#
+# s3 diff check
+# expects and beginning and end date passed as arguments
+#
+function s3_diff_check() {
+
+  # print out the header
+  echo -e '\t      local / S3\t  local   /   S3    Status'
+
+  # arrays for holding the findings
+  backedup=()
+  partials=()
+  missing=()
+
+  # for every date on the local print out report in s3
+  for date in `cat ~/Pictures/Lightroom/bmansfield-diff.log | awk '{print $1}'`; do
+    IFS=' '
+    bucket=($(aws s3 ls s3://lightroom-bkup/Lightroom\ Photos/2017/${date}/ --human-readable --summarize \
+      | tail -2 | tr '\n' ' ' | cut -d: -f2- | awk '!($2="")' | awk '!($2="")' | tr -s " "))
+    bucket_file_count=${bucket[0]}
+    bucket_size=${bucket[1]}${bucket[2]}
+    local_file_count=$(cat ~/Pictures/Lightroom/bmansfield-diff.log | grep ${date} | awk '{print $6}')
+    local_size=$(cat ~/Pictures/Lightroom/bmansfield-diff.log | grep ${date} | awk '{print $2}')
+
+    # define the status of each date and append it to the array
+    if [ ${bucket_file_count} -eq 0 ] && [ ${local_file_count} -gt 0 ]; then
+      status=${cross}
+      missing+=(${date})
+    elif [ ${bucket_file_count} -ne $((${local_file_count}-1)) ]; then
+      status=${warning}
+      partials+=(${date})
+    else
+      status=${checkmark}
+      backedup+=(${date})
+    fi
+
+    # print the report of that date
+    printf '%-14s %-6s %-10s %-9s %-9s %-15s\n' "${date}" "${local_file_count}" "${bucket_file_count}" "${local_size}" "${bucket_size}" "${status}"
+  done
+
+  # if nothing missing then ...
+  if [ ${#missing[@]} -eq 0 ] && [ ${#partials[@]} -eq 0 ]; then
+    s3_diff_check_ok
+
+  # I need an elif for if there is nothing in s3
+  # then the user needs to back all of their photos up to the external
+  # dont even give them the choice to continue or delete anything
+
+  else # prompt user for how to handle the discrepancies
+    # this still needs to be it's own function
+    # the issue is passing it the backedup array as an argument
+    # its not straight forward, it can be done
+    # i just dont have time to do it and test it now
+    # just wanted to put this as a reminder
+    echo "It seems there are still some things missing in S3"
+
+    read -r -p " What would you like to do $CR $CR
+    1) Delete only the ones backed up to S3 (recommended) $CR
+    2) Delete them all anyways (not recommended) $CR
+    3) Backup the missing photos to external (not tested yet) $CR
+    4) Perform another task (main menu) $CR
+    5) Nothing/Exit/Quit [Quit/quit/Q/q] $CR
+    > " input
+
+    case $input in
+      1)
+        # still need to remind user that they need to repoint the photos first
+        delete_only_safe ${backedup[@]}
+        ;;
+      2)
+        delete_all
+        ;;
+      3)
+        backup_to_external
+        ;;
+      4)
+        main
+        ;;
+      5|[qQ][uU][iI][tT]|[qQ])
+        tput bel
+        quit_prompt
+        exit 1
+        ;;
+      *)
+        tput bel
+        invalid_input
+        exit 1
+        ;;
+    esac
+  fi
+}
+
+#
+# external hard drive diff check for all
+# expects argument to be passed so it knows what to check against
+#
+function ext_diff_check() {
+  sources=(${LOCAL_LR_PATH} ${EXT_LR_PATH})
+
+  rm ${LOG_FILE_PATH}/*-diff.log
+
+  # loop over local and ext drive getting lightroom parent (year) dirs and dig into their child dirs for comparison
+  for source in ${sources[@]}; do
+    echo "source is ${source}"
+
+    # set the range
+    if [ $1 -eq 1 ]; then
+      range=`find ${source} -maxdepth 1 -type d | grep -P "\d{4}" | grep -v -P '-'`
+      echo "range is ${range}"
+    elif [ $1 -eq 3 ]; then
+      range=$2
+      echo "range is ${range}"
+      echo "dir passed is $2"
+    else
+      echo "It's something else"
+    fi
+
+    for d in "${source}/${range}"; do
+      results=`echo "${source}" | cut -d '/' -f3`
+      echo "source is ${source}"
+      echo "d is ${d}"
+      cd "${d}"
+
+      find . \( -path './*/*' -o -type d \) -printf '%Tb %Td %TH:%TM/%s/%p\0' | gawk -F/ -v'RS=\0' '
+        BEGIN{
+          split("K/M/G/T/P/E/Z/Y", u)
+        }
+        function h(n, i) {
+          while (n >= 1024) {n /= 1024; i++}
+          return sprintf("%.4g%s", n, u[i])
+        }
+        {
+          s[$4] += $2
+          n[$4]++}
+          NF == 4 {t[$4] = $1}
+        END{
+          PROCINFO["sorted_in"] = "@ind_str_asc"
+          for (d in t) printf "%-13s %-8s %-15s %s\n", d, h(s[d]), t[d], n[d]
+        }' >> ${LOG_FILE_PATH}/${results}-diff.log
+      cd -
+    done
+  done
+
+  files=(`find ${LOG_FILE_PATH} -type f -name "*-diff.log"`)
+
+  # missing from storage
+  echo "Missing from external or something has modified since last backup to external"
+  comm -23 ${files[0]} ${files[1]}
+
+  # missing from local
+  echo "missing from local or have been changed on storage since last sync"
+  comm -13 ${files[0]} ${files[1]}
+
+  # a combined list
+  # comm -3 ${files[0]} ${files[1]} | sed 's/^\t//'
+
+  echo "A combined look at both side by side"
+  diff -Ny ${files[0]} ${files[1]}
+  # diff -C0 ${files[0]} ${files[1]}
+
+  if [[ $(comm -23 ${LOG_FILE_PATH}/bmansfield-diff.log ${LOCAL_LR_PATH}/Storage-diff.log | wc -l) -gt 0 ]]; then
+    tput bel
+    echo "There seems to be missing or modified local files since last external hard drive backup"
+    echo "I highly suggest performing an external hard drive backup before deleting your local files"
+    read -r -p "Would you like me to do that for you now? [y/N] " input
+    case $input in
+      [yY][eE][sS]|[yY])
+        backup_to_external
+        ;;
+      [nN][oO]|[nN])
+        :
+        ;;
+      *)
+        tput bel
+        invalid_input
+        exit 1
+        ;;
+    esac
+  else # no diffs between local and external hard drive
+    echo "I don't see any differences. It looks clear to remove everything from your local."
+    echo "But you should really check if those files are in S3 as well in case your hard drive crashes"
+
+    read -r -p "Would you like me to check? [Y/n] " input
+
+    case $input in
+      [yY][eE][sS]|[yY])
+        s3_diff_check
+        ;;
+      [nN][oO]|[nN])
+        tput bel
+        read -r -p "Would you like still to proceed with clearing your local Lightroom photos without check S3? (not recommended) [Y/n] " delete
+        case $delete in
+          [yY][eE][sS]|[yY])
+            echo "first arg passed is $1"
+            if [ $1 -eq 1 ]; then
+              delete_all
+            elif [ $1 -eq 3 ]; then
+              delete_dir $2
+            else
+              echo "something else"
+            fi
+            ;;
+          [nN][oO]|[nN])
+            prompt_to_reselect
+            ;;
+          *)
+            tput bel
+            invalid_input
+            exit 1
+            ;;
+        esac
+        ;;
+      *)
+        tput bel
+        invalid_input
+        exit 1
+        ;;
+    esac
+  fi
+}
+
+#
+# prompt user for which dir to delete
+# expects an argument to be passed so it can pass it on to diff check function
+#
+function select_dir_prompt() {
+
+  cr=`echo $'\n.'`
+  cr=${cr%.}
+  declare -A dirs
+  prompt_string="Please select which directory (date) you would like to clear from your local hard drive? (by number) $cr $cr"
+  pwd=${PWD}
+  cd ${LOCAL_LR_PATH}
+
+  # make list of directories for prompt string
+  index=1
+  last_dir=${index}
+  for dir in `find * -maxdepth 2 -type d -print | grep -P "\d{4}" | grep -v -P "[a-z]+"`; do
+    index_as_string="${index}"
+    last_dir=${index}
+    dir_string=``
+
+    # append dir to prompt string with selection number
+    prompt_string="$prompt_string $index_as_string) $dir $cr"
+
+    # bump the index
+    index=$((index=index+1))
+
+    # append to the directory associtive array
+    dirs+=([${index_as_string}]="${dir}")
+  done
+
+  cd ${pwd}
+
+  # add an additional item to prompt string for none
+  index_as_string="$index"
+  prompt_string="$prompt_string $index_as_string) None of the above/I do not see the directory or date [Q/q] $cr"
+  prompt_string="$prompt_string > "
+
+  read -r -p "I found the following directories (dates) containing images $cr $cr $prompt_string" dir
+
+  echo "dir is ${dir}"
+  echo "last dir is ${last_dir}"
+
+  case $dir in
+    $index_as_string|[qQ][uU][iI][tT]|[qQ])
+      quit_prompt
+      ;;
+    [[:digit:]])
+      read -r -p "You selected ${dirs[$dir]} directory/date to remove from your local hard drive. Is this correct? [Y/n] " selection
+
+      case ${selection} in
+        [yY][eE][sS]|[yY])
+          ext_diff_check $1 ${dirs[$dir]}
+          ;;
+        [nN][oO]|[nN])
+          select_dir_prompt $1
+          ;;
+        *)
+          tput bel
+          invalid_input
+          exit 1
+          ;;
+      esac
+      ;;
+    *)
+      tput bel
+
+      echo "TESTING: dir is ${dir}"
+      echo "TESTING: last dir is ${last_dir}"
+
+      invalid_input
+      exit 1
+      ;;
+  esac
+
+}
+
+#
+# main entry point for diff check all
+# checks if it is ok to blow away all of local lightroom photos
+# if will check for differences between local and external hard drive (if attached) first
+# then it will check for differences between local and S3
+#
+function diff_check_main() {
+
+  # check if external drive is connected
+  external_drive_check
+
+  IFS=$'\n';
+
+  # if no external hard drives attached
+  # prompt for s3 comparison
+  if [[ "${#EXT_DRIVES[@]}" -lt '1' ]]; then
+    echo "I'm sorry, I can not check if you have backed them up to an external hard drive, because I do not see any external hard drives."
+    echo "Please attach a hard drive and check again."
+    echo "I can still check S3 though"
+
+    read -r -p "Would you like me to check? [Y/n] " input
+
+    case $input in
+      [yY][eE][sS]|[yY])
+        s3_diff_check
+        ;;
+      [nN][oO]|[nN])
+        read -r -p "Would you like still to proceed with clearing your local Lightroom photos without check S3? (not recommended) [Y/n] " delete
+        case $delete in
+          [yY][eE][sS]|[yY])
+            delete_all
+            ;;
+          [nN][oO]|[nN])
+            tput bel
+            prompt_to_reselect
+            ;;
+          *)
+            tput bel
+            invalid_input
+            ;;
+        esac
+        ;;
+      *)
+        tput bel
+        invalid_input
+        ;;
+    esac
+  else # external hard drive comparison for all dirs
+    case $1 in
+      1)
+        ext_diff_check $1
+        ;;
+      3)
+        select_dir_prompt $1
+        ;;
+      *)
+        tput bel
+        invalid_input
+        ;;
+    esac
+  fi
+
+  # summary feature still needs to be completed
+  echo "before you had little space left on your hard drive"
+  echo "only X space left"
+  echo "X amount of space taken up on your hard drive"
+  echo "just look now, you have so X much more space"
+  echo "and X amount is now free! Yay!"
+}
+
+#
+# diff check range
+#
+function diff_check_range() {
+  echo "Hi! I'm not done yet"
+}
+
+#
+# delete directory prompt
+#
+function delete_dir_prompt() {
+  pwd=${PWD}
+  index=0
+
+  cd ${LOCAL_LR_PATH}
+
+  for d in `find -maxdepth 2 -type d | grep -P "\d{4}" | grep -v -P "[a-z]+"`; do
+    index=$((index=index+1))
+    echo "${index}) ${d}";
+  done
+
+  cd ${pwd}
+
+  read -r -p " Please select the first date in the range to be cleared $CR $CR
+    1) All $CR
+    2) Range (e.g. 1-5) $CR
+    3) A single date (directory) $CR
+    4) None/Quit [Quit/quit/Q/q] $CR
+    > " dir
+
+  deletion_check $1 $dir
+}
+
+#
+# delete range prompt
+# not done yet
+#
+function delete_range_prompt() {
+  echo "not completed or tested yet"
+  pwd=${PWD}
+  index=0
+
+  cd ${LOCAL_LR_PATH}
+
+  for d in `find -maxdepth 2 -type d | grep -P "\d{4}" | grep -v -P "[a-z]+"`; do
+    index=$((index=index+1))
+    echo "${index}) ${d}";
+  done
+
+  cd ${pwd}
+
+  read -r -p " Please select the first date in the range to be cleared $CR $CR
+    1) All $CR
+    2) Range (e.g. 1-5) $CR
+    3) A single date (directory) $CR
+    4) None/Quit [Quit/quit/Q/q] $CR
+    > " first
+
+  read -r -p " Please select the last date in the range to be cleared $CR $CR
+    1) All $CR
+    2) Range (e.g. 1-5) $CR
+    3) A single date (directory) $CR
+    4) None/Quit [Quit/quit/Q/q] $CR
+    > " last
+
+  deletion_check $1 $first $last
+}
+
+#
+# prompt for a check before continuing
+# expects the users selection to be passed as an argument
+#
+function deletion_check() {
+  echo "This operation is permanent and can not be undone!"
+  echo "Before continuing, you should be confident that you have copies on your external hard drive and in S3"
+  echo "If you would like, I am capable of performing some diff checks for you"
+
+  read -r -p "Would you like me to check for you? (highly recommended) [Y/n] " input
+
+  case $input in
+    [yY][eE][sS]|[yY])
+      case $1 in
+        1)
+          diff_check_main $1
+          ;;
+        2)
+          diff_check_range $2 $3 # not done yet
+          ;;
+        3)
+          diff_check_main $1
+          ;;
+        *)
+          invalid_input
+          ;;
+      esac
+      ;;
+    [nN][oO]|[nN])
+      case $1 in
+        1)
+          delete_all
+          ;;
+        2)
+          diff_check_range $2 $3 # need to point to correct function
+          ;;
+        3)
+          select_dir_prompt $1
+          ;;
+        *)
+          invalid_input
+          ;;
+      esac
+      ;;
+    *)
+      invalid_input
+      ;;
+  esac
+}
+
+#
+# main entry point for clear local hard drive task
+#
+function clear_local() {
+  pwd=${PWD}
+  index=0
+
+  cd ${LOCAL_LR_PATH}
+  echo "I found the following directories in your local Lightroom directory ${LOCAL_LR_PATH} containing images."
+
+  for d in `find -maxdepth 2 -type d | grep -P "\d{4}" | grep -v -P "[a-z]+"`; do
+    index=$((index=index+1))
+    echo "${index}) ${d}";
+  done
+
+  cd ${pwd}
+  read -r -p " Which ones would you like to remove? $CR $CR
+    1) All $CR
+    2) Range (e.g. 1-5) (still not ready) $CR
+    3) A single date (directory) $CR
+    4) None/Quit [Quit/quit/Q/q] $CR
+    > " input
+
+  case $input in
+    1)
+      deletion_check $input
+      ;;
+    2)
+      delete_range_prompt $input # still to do
+      ;;
+    3)
+      deletion_check $input # still to do
+      ;;
+    4|[qQ][uU][iI][tT]|[qQ])
+      quit_prompt
+      ;;
+    *)
+      invalid_input
+      ;;
+  esac
+}
+
+#===================================================#
+#
+#       New Features
+# Still to do: Not ready yet
+#
+#==================================================#
+
+# sync local from external task
+function sync_local_from_external() {
+  echo "If I where a real script I would be proceeding to sync your local from an external drive"
+  echo "But since this is just a test, I am only echo'ing"
+  echo "But let's assume that everything backed up successfully"
+  success_more_backups
+}
+
+# pull down photos from S3
+function pull_down_from_s3() {
+  echo "If I where a real script I would be proceeding to pull down photos from s3"
+  echo "But since this is just a test, I am only echo'ing"
+  echo "But let's assume that everything backed up successfully"
+  success_more_backups
+}
+
+# run the main entry point function
+main
