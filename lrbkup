@@ -33,7 +33,7 @@ S3_BKUP_ARCHIVED_LOGS_PATH="$BKUP_ARCHIVED_LOGS_PATH/external-to-s3"
 CR=$(printf '\r')
 options=("Backup my local photos to an external drive" "Backup my external drive to S3" "Clear local photos from ${LOCAL_LR_PATH}" "Sync my local from an external drive" "Pull down photos from S3" "Quit [Quit/quit/Q/q]")
 
-# a few small things for pretty outputs
+# a few small variables for pretty outputs
 red='\033[0;31m'
 green='\033[0;32m'
 yellow='\033[0;33m'
@@ -775,13 +775,13 @@ function s3_diff_check() {
     local_size=$(cat ~/Pictures/Lightroom/bmansfield-diff.log | grep ${date} | awk '{print $2}')
 
     # define the status of each date and append it to the array
-    if [ ${bucket_file_count} -eq 0 ] && [ ${local_file_count} -gt 0 ]; then
+    if [ ${bucket_file_count} -eq 0 ] && [ ${local_file_count} -gt 0 ]; then # if s3 is eq to 0 and local has any files
       status=${cross}
       missing+=(${date})
-    elif [ ${bucket_file_count} -ne $((${local_file_count}-1)) ]; then
+    elif [ ${bucket_file_count} -ne ${local_file_count} ]; then # if s3 is not the same as local
       status=${warning}
       partials+=(${date})
-    else
+    else # otherwise it must be equal
       status=${checkmark}
       backedup+=(${date})
     fi
@@ -853,69 +853,96 @@ function ext_diff_check() {
 
   # loop over local and ext drive getting lightroom parent (year) dirs and dig into their child dirs for comparison
   for source in ${sources[@]}; do
-    echo "source is ${source}"
 
-    # set the range
-    if [ $1 -eq 1 ]; then
-      range=`find ${source} -maxdepth 1 -type d | grep -P "\d{4}" | grep -v -P '-'`
-      echo "range is ${range}"
-    elif [ $1 -eq 3 ]; then
-      range=$2
-      echo "range is ${range}"
-      echo "dir passed is $2"
+    years=()
+
+    # find all top level dirs (years)
+    if [ ${1} -eq 1 ]; then
+      for i in `find ${source} -maxdepth 1 -type d | grep -P "\d{4}" | grep -v -P '-'`; do
+        years+=(${i})
+      done
+    elif [ ${1} -eq 3 ]; then
+      echo "still working on this part"
+      # this one needs to be redone
+      # I dont know what i'm doing here yet
+      # range=${2}
     else
-      echo "It's something else"
+      echo "Range is something else other than 1 or 3"
     fi
 
-    for d in "${source}/${range}"; do
-      results=`echo "${source}" | cut -d '/' -f3`
-      echo "source is ${source}"
-      echo "d is ${d}"
-      cd "${d}"
+    # loop over every year
+    for y in "${years[@]}"; do
+      year=`basename ${y}`
 
-      find . \( -path './*/*' -o -type d \) -printf '%Tb %Td %TH:%TM/%s/%p\0' | gawk -F/ -v'RS=\0' '
-        BEGIN{
-          split("K/M/G/T/P/E/Z/Y", u)
-        }
-        function h(n, i) {
-          while (n >= 1024) {n /= 1024; i++}
-          return sprintf("%.4g%s", n, u[i])
-        }
-        {
-          s[$4] += $2
-          n[$4]++}
-          NF == 4 {t[$4] = $1}
-        END{
-          PROCINFO["sorted_in"] = "@ind_str_asc"
-          for (d in t) printf "%-13s %-8s %-15s %s\n", d, h(s[d]), t[d], n[d]
-        }' >> ${LOG_FILE_PATH}/${results}-diff.log
-      cd -
+      # loop over every date in year
+      for d in "${source}/${year}"; do
+        srcdiff=`echo "${source}" | cut -d '/' -f3`
+        cd "${d}"
+
+        # find any dirs in current source and year parent, get meta info and print to diff file
+        find . \( -path './*/*' -o -type d \) -printf '%Tb %Td %TH:%TM/%s/%p\0' | gawk -F/ -v'RS=\0' '
+          BEGIN{
+            split("K/M/G/T/P/E/Z/Y", u)
+          }
+          function h(n, i) {
+            while (n >= 1024) {n /= 1024; i++}
+            return sprintf("%.4g%s", n, u[i])
+          }
+          function x(n, i) {
+            c=(n-1)
+            return sprintf("%s", c)
+          }
+          {
+            s[$4] += $2
+            n[$4]++}
+            NF == 4 {t[$4] = $1}
+          END{
+            PROCINFO["sorted_in"] = "@ind_str_asc"
+            for (d in t) printf "%-13s %-8s %-15s %s\n", d, h(s[d]), t[d], x(n[d])
+          }' >> ${LOG_FILE_PATH}/${srcdiff}-diff.log
+        cd -
+      done
     done
   done
 
+  # print out some comparisons to screen
   files=(`find ${LOG_FILE_PATH} -type f -name "*-diff.log"`)
 
-  # missing from storage
+  # missing from external hard drive
+  echo ""
+  echo ""
   echo "Missing from external or something has modified since last backup to external"
-  comm -23 ${files[0]} ${files[1]}
+  echo ""
+  if [[ $(comm -23 ${files[0]} ${files[1]} | wc -l) -gt 0 ]]; then
+    comm -23 ${files[0]} ${files[1]}
+  else
+    echo "No differences"
+  fi
 
   # missing from local
-  echo "missing from local or have been changed on storage since last sync"
+  echo ""
+  echo ""
+  echo "Missing from local or have been changed on external hard drive since last sync"
+  echo ""
   comm -13 ${files[0]} ${files[1]}
 
   # a combined list
   # comm -3 ${files[0]} ${files[1]} | sed 's/^\t//'
-
+  echo ""
+  echo ""
   echo "A combined look at both side by side"
+  echo ""
   diff -Ny ${files[0]} ${files[1]}
-  # diff -C0 ${files[0]} ${files[1]}
+  # diff -C0 ${files[0]} ${files[1]} # not sure if I need/want this comparison
+  echo ""
 
-  if [[ $(comm -23 ${LOG_FILE_PATH}/bmansfield-diff.log ${LOCAL_LR_PATH}/Storage-diff.log | wc -l) -gt 0 ]]; then
+  # prompt user how to proceed based on comparison results
+  if [[ $(comm -23 ${files[0]} ${files[1]} | wc -l) -gt 0 ]]; then
     tput bel
     echo "There seems to be missing or modified local files since last external hard drive backup"
     echo "I highly suggest performing an external hard drive backup before deleting your local files"
     read -r -p "Would you like me to do that for you now? [y/N] " input
-    case $input in
+    case ${input} in
       [yY][eE][sS]|[yY])
         backup_to_external
         ;;
@@ -934,14 +961,14 @@ function ext_diff_check() {
 
     read -r -p "Would you like me to check? [Y/n] " input
 
-    case $input in
+    case ${input} in
       [yY][eE][sS]|[yY])
         s3_diff_check
         ;;
       [nN][oO]|[nN])
         tput bel
         read -r -p "Would you like still to proceed with clearing your local Lightroom photos without check S3? (not recommended) [Y/n] " delete
-        case $delete in
+        case ${delete} in
           [yY][eE][sS]|[yY])
             echo "first arg passed is $1"
             if [ $1 -eq 1 ]; then
@@ -1267,7 +1294,7 @@ function clear_local() {
       delete_range_prompt $input # still to do
       ;;
     3)
-      deletion_check $input # still to do
+      deletion_check $input
       ;;
     4|[qQ][uU][iI][tT]|[qQ])
       quit_prompt
